@@ -6120,6 +6120,9 @@
   "/xueqiu/stock_info/:id/:type?": [
     "YuYang"
   ],
+  "/xueqiu/timeline": [
+    "ErnestDong"
+  ],
   "/xueqiu/today": [
     "nczitzk"
   ],
