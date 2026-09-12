@@ -25,22 +25,50 @@
  * For more details of these functions, please refer to the jsDoc in the source code.
  */
 
-import ofetch from '@/utils/ofetch';
-import { type Cheerio, type CheerioAPI, type Element, load } from 'cheerio';
-import { parseDate } from '@/utils/parse-date';
+import type { Cheerio, CheerioAPI } from 'cheerio';
+import { load } from 'cheerio';
+import type { Element } from 'domhandler';
+
 import cache from '@/utils/cache';
 import logger from '@/utils/logger';
+import ofetch from '@/utils/ofetch';
+import { parseDate } from '@/utils/parse-date';
 
-const MAINTAINERS = ['Rongronggg9'];
+class WeChatMpError extends Error {
+    constructor(message: string) {
+        super(message);
+        this.name = 'WeChatMpError';
+    }
+}
 
-const warn = (reason: string, details: string) =>
-    logger.warn(`wechat-mp: ${reason}: ${details},
-consider raise an issue (mentioning ${MAINTAINERS.join(', ')}) with the article URL for further investigation`);
+const MAINTAINERS = ['@Rongronggg9'];
+
+const formatLogNoMention = (...params: string[]): string => `wechat-mp: ${params.join(': ')}`;
+const formatLog = (...params: string[]): string => `${formatLogNoMention(...params)}
+Consider raise an issue (mentioning ${MAINTAINERS.join(', ')}) with the article URL for further investigation`;
+let warn = (...params: string[]) => logger.warn(formatLog(...params));
+const error = (...params: string[]): never => {
+    const msg = formatLog(...params);
+    logger.error(msg);
+    throw new WeChatMpError(msg);
+};
+const errorNoMention = (...params: string[]): never => {
+    const msg = formatLogNoMention(...params);
+    logger.error(msg);
+    throw new WeChatMpError(msg);
+};
+const toggleWerror = (() => {
+    const onFunc = (...params: string[]) => error('WarningAsError', ...params);
+    const offFunc = warn;
+    return (on: boolean) => {
+        warn = on ? onFunc : offFunc;
+    };
+})();
 
 const replaceReturnNewline = (() => {
     const returnRegExp = /\r|\\(r|x0d)/g;
     const newlineRegExp = /\n|\\(n|x0a)/g;
-    return (text: string, replaceReturnWith = '', replaceNewlineWith = '<br>') => text.replaceAll(returnRegExp, replaceReturnWith).replaceAll(newlineRegExp, replaceNewlineWith);
+    return (text: string, replaceReturnWith = '', replaceNewlineWith = '<br>') => text.replaceAll(returnRegExp, () => replaceReturnWith).replaceAll(newlineRegExp, () => replaceNewlineWith);
 })();
 const fixUrl = (() => {
     const ampRegExp = /(&|\\x26)amp;/g;
@@ -64,15 +92,15 @@ class LoopReturn extends Error {
     }
 }
 
-const forEachScript = ($: CheerioAPI | string, callback: (script) => void, defaultReturn: any = null, selector = 'script[nonce][type="text/javascript"]') => {
-    const scripts = typeof $ === 'string' ? [$] : $(selector).toArray();
-    for (const script of scripts) {
+const forEachScript = ($: CheerioAPI, callback: (script) => void, defaultReturn: any = null, selector = 'script[nonce][type="text/javascript"]') => {
+    for (const script of $(selector).toArray()) {
         try {
             callback(script);
         } catch (error) {
             if (error instanceof LoopReturn) {
                 return error.to_return;
-            } else if (error instanceof LoopContinue) {
+            }
+            if (error instanceof LoopContinue) {
                 continue;
             }
             throw error;
@@ -102,12 +130,12 @@ const showTypeMap = {
 const showTypeMapReverse = Object.fromEntries(Object.entries(showTypeMap).map(([k, v]) => [v, k]));
 
 class ExtractMetadata {
-    private static genAssignmentRegExp = (varName: string, valuePattern: string, assignPattern: string) => RegExp(`\\b${varName}\\s*${assignPattern}\\s*(?<quote>["'])(?<value>${valuePattern})\\k<quote>`, 'mg');
+    private static genAssignmentRegExp = (varName: string, valuePattern: string, assignPattern: string) => new RegExp(String.raw`\b${varName}\s*${assignPattern}\s*(?<quote>["'])(?<value>${valuePattern})\k<quote>`, 'gm');
 
     private static genExtractFunc = (
         varName: string,
         {
-            valuePattern = '\\w+',
+            valuePattern = String.raw`\w+`,
             assignPattern = '=',
             allowNotFound = false,
             multiple = false,
@@ -122,7 +150,7 @@ class ExtractMetadata {
         return (str: string) => {
             const values: string[] = [];
             for (const match of str.matchAll(regExp)) {
-                const value = <string>match.groups?.value;
+                const value = match.groups!.value;
                 if (!multiple) {
                     return value;
                 }
@@ -136,53 +164,79 @@ class ExtractMetadata {
     };
 
     private static doExtract = (metadataToBeExtracted: Record<string, (str: string) => string | string[] | null | undefined>, scriptText: string) => {
-        const metadataExtracted: Record<string, string | string[]> = {};
+        const metadataExtracted: Record<string, string | string[] | null | undefined> = {};
         for (const [key, extractFunc] of Object.entries(metadataToBeExtracted)) {
-            metadataExtracted[key] = <string>extractFunc(scriptText);
+            metadataExtracted[key] = extractFunc(scriptText);
         }
         metadataExtracted._extractedFrom = scriptText;
         return metadataExtracted;
     };
 
     private static commonMetadataToBeExtracted = {
-        showType: this.genExtractFunc('item_show_type', { valuePattern: '\\d+' }),
-        realShowType: this.genExtractFunc('real_item_show_type', { valuePattern: '\\d+' }),
-        createTime: this.genExtractFunc('ct', { valuePattern: '\\d+' }),
+        showType: this.genExtractFunc('item_show_type', { valuePattern: String.raw`\d+`, allowNotFound: true }),
+        realShowType: this.genExtractFunc('real_item_show_type', { valuePattern: String.raw`\d+` }),
+        createTime: this.genExtractFunc('ct', { valuePattern: String.raw`\d+`, allowNotFound: true }),
         sourceUrl: this.genExtractFunc('msg_source_url', { valuePattern: `https?://[^'"]*`, allowNotFound: true }),
     };
 
-    static common = ($: CheerioAPI) =>
-        forEachScript(
+    private static showTypeMetadataToBeExtracted = {
+        showType: this.genExtractFunc('item_show_type', { valuePattern: String.raw`\d+` }),
+    };
+
+    static common = ($: CheerioAPI) => {
+        const metadataExtracted = forEachScript(
             $,
             (script) => {
                 const scriptText = $(script).text();
-                const metadataExtracted = <Record<string, string>> this.doExtract(this.commonMetadataToBeExtracted, scriptText);
-                const showType = showTypeMapReverse[metadataExtracted.showType];
-                const realShowType = showTypeMapReverse[metadataExtracted.realShowType];
-                metadataExtracted.sourceUrl = metadataExtracted.sourceUrl && fixUrl(metadataExtracted.sourceUrl);
-                if (showType) {
-                    metadataExtracted.showType = showType;
-                } else {
-                    warn('showType not found', `item_show_type=${metadataExtracted.showType}`);
-                }
-                if (realShowType) {
-                    metadataExtracted.realShowType = realShowType;
-                } else {
-                    warn('realShowType not found', `real_item_show_type=${metadataExtracted.realShowType}`);
-                }
-                if (metadataExtracted.showType !== metadataExtracted.realShowType) {
-                    // never seen this happen, waiting for examples
-                    warn('showType mismatch', `item_show_type=${metadataExtracted.showType}, real_item_show_type=${metadataExtracted.realShowType}`);
-                }
+                const metadataExtracted = this.doExtract(this.commonMetadataToBeExtracted, scriptText);
                 throw new LoopReturn(metadataExtracted);
             },
             {},
             'script[nonce][type="text/javascript"]:contains("real_item_show_type")'
         );
 
+        // APP_MSG_PAGE has its item_show_type in a separate script
+        if (!metadataExtracted.showType) {
+            const showTypeExtracted = forEachScript(
+                $,
+                (script) => {
+                    const scriptText = $(script).text();
+                    const metadataExtracted = this.doExtract(this.showTypeMetadataToBeExtracted, scriptText);
+                    throw new LoopReturn(metadataExtracted);
+                },
+                {},
+                'script[nonce][type="text/javascript"]:contains("item_show_type")'
+            );
+            if (showTypeExtracted.showType) {
+                metadataExtracted.showType = showTypeExtracted.showType;
+            }
+        }
+
+        const showType = showTypeMapReverse[metadataExtracted.showType];
+        const realShowType = showTypeMapReverse[metadataExtracted.realShowType];
+        if (metadataExtracted.sourceUrl) {
+            metadataExtracted.sourceUrl = fixUrl(metadataExtracted.sourceUrl);
+        }
+        if (showType) {
+            metadataExtracted.showType = showType;
+        } else {
+            warn('showType not found', `item_show_type=${metadataExtracted.showType}`);
+        }
+        if (realShowType) {
+            metadataExtracted.realShowType = realShowType;
+        } else {
+            warn('realShowType not found', `real_item_show_type=${metadataExtracted.realShowType}`);
+        }
+        if (metadataExtracted.showType !== metadataExtracted.realShowType) {
+            // never seen this happen, waiting for examples
+            warn('showType mismatch', `item_show_type=${metadataExtracted.showType}, real_item_show_type=${metadataExtracted.realShowType}`);
+        }
+        return metadataExtracted;
+    };
+
     private static audioMetadataToBeExtracted = {
         voiceId: this.genExtractFunc('voiceid', { assignPattern: ':' }),
-        duration: this.genExtractFunc('duration', { valuePattern: '\\d*', assignPattern: ':', allowNotFound: true }),
+        duration: this.genExtractFunc('duration', { valuePattern: String.raw`\d*`, assignPattern: ':', allowNotFound: true }),
     };
 
     // never seen a audio article containing multiple audio, waiting for examples
@@ -191,7 +245,7 @@ class ExtractMetadata {
             $,
             (script) => {
                 const scriptText = $(script).text();
-                const metadataExtracted = <Record<string, string>> this.doExtract(this.audioMetadataToBeExtracted, scriptText);
+                const metadataExtracted = this.doExtract(this.audioMetadataToBeExtracted, scriptText);
                 throw new LoopReturn(metadataExtracted);
             },
             {},
@@ -207,7 +261,7 @@ class ExtractMetadata {
             $,
             (script) => {
                 const scriptText = $(script).text();
-                const metadataExtracted = <Record<string, string[]>> this.doExtract(this.imgMetadataToBeExtracted, scriptText);
+                const metadataExtracted = this.doExtract(this.imgMetadataToBeExtracted, scriptText);
                 if (Array.isArray(metadataExtracted.imgUrls)) {
                     metadataExtracted.imgUrls = metadataExtracted.imgUrls.map((url) => fixUrl(url));
                 }
@@ -291,13 +345,8 @@ const genVideoSrc = (videoId: string) => {
  * @param {boolean} skipImg - Whether to skip fixing images.
  * @return {string} - The fixed html, a string.
  */
-const fixArticleContent = (html?: string | Cheerio<Element>, skipImg = false) => {
-    let htmlResult = '';
-    if (typeof html === 'string') {
-        htmlResult = html;
-    } else if (html?.html) {
-        htmlResult = html.html() || '';
-    }
+const fixArticleContent = (html?: string | Cheerio<Element>, skipImg = false): string => {
+    const htmlResult = (typeof html === 'string' ? html : html?.html()) || '';
     if (!htmlResult) {
         return '';
     }
@@ -325,10 +374,14 @@ const fixArticleContent = (html?: string | Cheerio<Element>, skipImg = false) =>
     // fix iframe: https://mp.weixin.qq.com/s/FnjcMXZ1xdS-d6n-pUUyyw
     $('iframe.video_iframe[data-src]').each((_, iframe) => {
         const $iframe = $(iframe);
-        const dataSrc = <string>$iframe.attr('data-src');
+        const dataSrc = $iframe.attr('data-src');
+        if (!dataSrc) {
+            return;
+        }
         const srcUrlObj = new URL(dataSrc);
-        if (srcUrlObj.host === 'v.qq.com' && srcUrlObj.searchParams.has('vid')) {
-            const newSrc = genVideoSrc(<string>srcUrlObj.searchParams.get('vid'));
+        const vid = srcUrlObj.searchParams.get('vid');
+        if (srcUrlObj.host === 'v.qq.com' && vid !== null) {
+            const newSrc = genVideoSrc(vid);
             $iframe.attr('src', newSrc);
             $iframe.removeAttr('data-src');
             const width = $iframe.attr('data-w');
@@ -336,7 +389,7 @@ const fixArticleContent = (html?: string | Cheerio<Element>, skipImg = false) =>
             if (width && ratio) {
                 const width_ = Math.min(Number.parseInt(width), 677);
                 $iframe.attr('width', width_.toString());
-                $iframe.attr('height', (width_ / Number.parseFloat(ratio)).toString());
+                $iframe.attr('height', (width_ / Number(ratio)).toString());
             }
         } // else {} FIXME: https://mp.weixin.qq.com/s?__biz=Mzg5Mjk3MzE4OQ==&mid=2247549515&idx=2&sn=a608fca597f0589c1aebd6d0b82ff6e9
     });
@@ -376,18 +429,21 @@ const fixArticleContent = (html?: string | Cheerio<Element>, skipImg = false) =>
 // abtest_cookie, wx_header
 // Known params (temporary link):
 // src, timestamp, ver, signature, new (unessential)
-const normalizeUrl = (url, bypassHostCheck = false) => {
+const normalizeUrl = (url: string, bypassHostCheck = false) => {
     const oriUrl = url;
+    // already seen some weird urls with `&` escaped as `&amp;`, so fix it
+    // calling fixUrl should always be safe since having `&amp;` or `\x26` in a URL is meaningless
+    url = fixUrl(url);
     const urlObj = new URL(url);
     if (!bypassHostCheck && urlObj.host !== 'mp.weixin.qq.com') {
-        throw new Error('wechat-mp: URL host must be "mp.weixin.qq.com", but got ' + oriUrl);
+        error('URL host must be "mp.weixin.qq.com"', url);
     }
     urlObj.protocol = 'https:';
     urlObj.hash = ''; // remove hash
-    if (/^\/s\/.+/.test(urlObj.pathname)) {
+    if (urlObj.pathname.startsWith('/s/')) {
         // a short link, just remove all the params
         urlObj.search = '';
-    } else if (/^\/s$/.test(urlObj.pathname)) {
+    } else if (urlObj.pathname === '/s') {
         const biz = urlObj.searchParams.get('__biz');
         const mid = urlObj.searchParams.get('mid') || urlObj.searchParams.get('appmsgid');
         const idx = urlObj.searchParams.get('idx') || urlObj.searchParams.get('itemidx');
@@ -405,17 +461,29 @@ const normalizeUrl = (url, bypassHostCheck = false) => {
                 // a temporary link, remove all unessential params
                 urlObj.search = `?src=${src}&timestamp=${timestamp}&ver=${ver}&signature=${signature}`;
             } else {
-                // unknown link, just let it go
+                warn('unknown URL search parameters', oriUrl);
             }
         }
     } else {
-        // IDK what it is, just let it go
+        warn('unknown URL path', oriUrl);
     }
     return urlObj.href;
 };
 
+type WeChatMpPage = {
+    title: string;
+    author: string;
+    description: string;
+    summary: string;
+    pubDate?: Date;
+    mpName?: string;
+    enclosure_url?: string;
+    itunes_duration?: string | number;
+    enclosure_type?: string;
+};
+
 class PageParsers {
-    private static common = ($: CheerioAPI, commonMetadata: Record<string, string>) => {
+    private static common = ($: CheerioAPI, commonMetadata: Record<string, string>): WeChatMpPage => {
         const title = replaceReturnNewline($('meta[property="og:title"]').attr('content') || '', '', ' ');
         const author = replaceReturnNewline($('meta[name=author]').attr('content') || '', '', ' ');
         const pubDate = commonMetadata.createTime ? parseDate(Number.parseInt(commonMetadata.createTime) * 1000) : undefined;
@@ -425,17 +493,7 @@ class PageParsers {
         const description = summary;
         summary = summary.replaceAll('<br>', ' ') === title ? '' : summary;
 
-        return { title, author, description, summary, pubDate, mpName } as {
-            title: string;
-            author: string;
-            description: string;
-            summary: string;
-            pubDate?: Date;
-            mpName?: string;
-            enclosure_url?: string;
-            itunes_duration?: string | number;
-            enclosure_type?: string;
-        };
+        return { title, author, description, summary, pubDate, mpName };
     };
     private static appMsg = async ($: CheerioAPI, commonMetadata: Record<string, string>) => {
         const page = PageParsers.common($, commonMetadata);
@@ -479,9 +537,11 @@ class PageParsers {
         }
         return page;
     };
-    static dispatch = async ($: CheerioAPI) => {
+    static dispatch = async (html: string, url: string) => {
+        const $ = load(html);
         const commonMetadata = ExtractMetadata.common($);
-        let page: Record<string, any>;
+        let page: WeChatMpPage;
+        let pageText: string, pageTextShort: string;
         switch (commonMetadata.showType) {
             case 'APP_MSG_PAGE':
                 page = await PageParsers.appMsg($, commonMetadata);
@@ -495,8 +555,23 @@ class PageParsers {
             case 'VIDEO_SHARE_PAGE':
                 page = PageParsers.fallback($, commonMetadata);
                 break;
+            case undefined:
+                $('script, style').remove();
+                pageText = $('title, body').text().replaceAll(/\s+/g, ' ').trim();
+                pageTextShort = pageText.slice(0, 25);
+                if (pageText.length >= 25 + '...'.length) {
+                    pageTextShort = pageText.slice(0, 25);
+                    pageTextShort += '...';
+                }
+                if (pageText.includes('已被发布者删除')) {
+                    return errorNoMention('deleted by author', pageTextShort, url);
+                }
+                if (new URL(url).pathname.includes('captcha') || pageText.includes('环境异常')) {
+                    return errorNoMention('request blocked by WAF', pageTextShort, url);
+                }
+                return error('unknown page, probably due to WAF', pageTextShort, url);
             default:
-                warn('new showType, trying fallback method', `showType=${commonMetadata.showType}`);
+                warn('new showType, trying fallback method', `showType=${commonMetadata.showType}`, url);
                 page = PageParsers.fallback($, commonMetadata);
         }
         const locationMetadata = ExtractMetadata.location($);
@@ -517,6 +592,22 @@ class PageParsers {
     };
 }
 
+const redirectHelper = async (url: string, maxRedirects: number = 5) => {
+    const raw = await ofetch.raw(url, {
+        redirect: 'manual',
+    });
+    if ([301, 302, 303, 307, 308].includes(raw.status)) {
+        const location = raw.headers.get('location');
+        if (!location) {
+            error('redirect without location', url);
+        } else if (maxRedirects <= 1) {
+            error('too many redirects', url);
+        }
+        return await redirectHelper(new URL(location!, url).href, maxRedirects - 1);
+    }
+    return raw;
+};
+
 /**
  * Fetch article and its metadata from WeChat MP (mp.weixin.qq.com).
  *
@@ -528,22 +619,11 @@ class PageParsers {
 const fetchArticle = (url: string, bypassHostCheck: boolean = false) => {
     url = normalizeUrl(url, bypassHostCheck);
     return cache.tryGet(url, async () => {
-        const data = await ofetch(url);
-        const $ = load(data);
-        const page = await PageParsers.dispatch($);
+        const raw = await redirectHelper(url);
+        // pass the redirected URL to dispatcher for better error logging
+        const page = await PageParsers.dispatch(raw._data, raw.url);
         return { ...page, link: url };
-    }) as Promise<{
-        title: string;
-        author: string;
-        description: string;
-        summary: string;
-        pubDate?: Date;
-        mpName?: string;
-        link: string;
-        enclosure_type?: string;
-        enclosure_url?: string;
-        itunes_duration?: string | number;
-    }>;
+    });
 };
 
 /**
@@ -575,11 +655,11 @@ const finishArticleItem = async (item, setMpNameAsAuthor = false, skipLink = fal
                 item.link = skipLink ? item.link : fetchedItem.link || item.link;
                 break;
             default:
-                item[key] = item[key] || fetchedItem[key];
+                item[key] ||= fetchedItem[key];
         }
     }
     return item;
 };
 
-const exportedForTestingOnly = { ExtractMetadata, showTypeMapReverse };
-export { exportedForTestingOnly, fixArticleContent, fetchArticle, finishArticleItem, normalizeUrl };
+const exportedForTestingOnly = { toggleWerror, ExtractMetadata, showTypeMapReverse };
+export { exportedForTestingOnly, fetchArticle, finishArticleItem, fixArticleContent, normalizeUrl, WeChatMpError };
